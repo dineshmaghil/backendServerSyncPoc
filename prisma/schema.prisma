@@ -1,0 +1,21 @@
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model mh_off_orders {
+  id                String   @id @db.VarChar(36)
+  location_id       String   @db.VarChar(36)
+  customer_id       String?  @db.VarChar(36)
+  order_no          String   @db.VarChar(15)
+  order_type_id     String   @db.VarChar(36)
+  order_date        DateTime @db.Date
+  order_time        DateTime @db.Time(0)
+  ip_address        String   @db.VarChar(40)
+  user_agent        String   @db.VarChar(256)
+  updated_at        DateTime @default(now()) @updatedAt
+}
