@@ -19,3 +19,14 @@ model mh_off_orders {
   user_agent        String   @db.VarChar(256)
   updated_at        DateTime @default(now()) @updatedAt
 }
+
+model mh_products {
+  id             String   @id @db.VarChar(36)
+  product_code   String   @db.VarChar(50)
+  product_name   String   @db.VarChar(255)
+  description    String?  @db.Text
+  price          Decimal  @db.Decimal(10, 2)
+  stock_quantity Int      @default(0)
+  is_active      Boolean  @default(true)
+  updated_at     DateTime @default(now()) @updatedAt
+}
