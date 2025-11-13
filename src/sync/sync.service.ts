@@ -5,6 +5,29 @@ import { PrismaService } from '../prisma/prisma.service';
 export class SyncService {
   constructor(private readonly prisma: PrismaService) {}
 
+  // Helper to serialize BigInt values for JSON.stringify
+  private serializeBigInt(obj: any): any {
+    if (obj === null || obj === undefined) {
+      return obj;
+    }
+    if (typeof obj === 'bigint') {
+      return obj.toString();
+    }
+    if (Array.isArray(obj)) {
+      return obj.map(item => this.serializeBigInt(item));
+    }
+    if (typeof obj === 'object') {
+      const serialized: any = {};
+      for (const key in obj) {
+        if (Object.prototype.hasOwnProperty.call(obj, key)) {
+          serialized[key] = this.serializeBigInt(obj[key]);
+        }
+      }
+      return serialized;
+    }
+    return obj;
+  }
+
   // 🔁 Pull data since last sync
   async pull(lastPulledAt: string) {
     const since = lastPulledAt ? new Date(Number(lastPulledAt)) : new Date(0);
@@ -39,44 +62,59 @@ export class SyncService {
 
   // 📤 Push data from client
   async push(changes: any, lastPulledAt: string) {
+    console.log(`[Sync] Received push request with changes:`, JSON.stringify(changes, null, 2));
+    
     // Handle mh_off_orders
     if (changes?.mh_off_orders) {
+      console.log(`[Sync] Processing mh_off_orders`);
       await this.syncTable('mh_off_orders', changes.mh_off_orders, this.sanitizeOrderData.bind(this));
     }
 
     // Handle mh_products
     if (changes?.mh_products) {
+      console.log(`[Sync] Processing mh_products`);
       await this.syncTable('mh_products', changes.mh_products, this.sanitizeProductData.bind(this));
     }
 
+    console.log(`[Sync] Push completed successfully`);
     return { success: true };
   }
 
   // 🔄 Generic sync handler for any table
   private async syncTable(tableName: string, tableChanges: any, sanitizeFn: (item: any) => any) {
     const { created = [], updated = [], deleted = [] } = tableChanges;
+    console.log(`[Sync] syncTable called for ${tableName} - created: ${created.length}, updated: ${updated.length}, deleted: ${deleted.length}`);
+    
     const prisma = this.prisma as any;
     const model = prisma[tableName];
 
     // Check if model exists in Prisma client
     if (!model) {
-      console.warn(`Model ${tableName} not found in Prisma client. Using raw SQL fallback.`);
+      console.warn(`[Sync] Model ${tableName} not found in Prisma client. Using raw SQL fallback.`);
       // Fallback to raw SQL if model doesn't exist (e.g., Prisma client not regenerated)
       await this.syncTableRawSQL(tableName, tableChanges, sanitizeFn);
       return;
     }
 
+    console.log(`[Sync] Using Prisma model for ${tableName}`);
+
     // Handle created items
     for (const item of created) {
       try {
         const sanitized = sanitizeFn(item);
-        await model.upsert({
+        console.log(`[Sync] Upserting ${tableName} item:`, sanitized.id);
+        console.log(`[Sync] 📦 Data being inserted:`, JSON.stringify(sanitized, null, 2));
+        const result = await model.upsert({
           where: { id: sanitized.id },
           create: sanitized,
           update: sanitized,
         });
+        console.log(`[Sync] ✅ Successfully upserted ${tableName} item:`, sanitized.id);
+        const serializedResult = this.serializeBigInt(result);
+        console.log(`[Sync] 🔍 Inserted record:`, JSON.stringify(serializedResult, null, 2));
       } catch (error) {
-        console.error(`Error upserting ${tableName}:`, error);
+        console.error(`[Sync] ❌ Error upserting ${tableName}:`, error);
+        console.error(`[Sync] Item that failed:`, JSON.stringify(item, null, 2));
         throw error;
       }
     }
@@ -85,12 +123,15 @@ export class SyncService {
     for (const item of updated) {
       try {
         const sanitized = sanitizeFn(item);
+        console.log(`[Sync] Updating ${tableName} item:`, sanitized.id);
         await model.update({
           where: { id: sanitized.id },
           data: sanitized,
         });
+        console.log(`[Sync] Successfully updated ${tableName} item:`, sanitized.id);
       } catch (error) {
-        console.error(`Error updating ${tableName}:`, error);
+        console.error(`[Sync] Error updating ${tableName}:`, error);
+        console.error(`[Sync] Item that failed:`, item);
         throw error;
       }
     }
@@ -98,10 +139,12 @@ export class SyncService {
     // Handle deleted items
     for (const id of deleted) {
       try {
+        console.log(`[Sync] Deleting ${tableName} item:`, id);
         await model.delete({ where: { id } });
+        console.log(`[Sync] Successfully deleted ${tableName} item:`, id);
       } catch (error) {
         // Silently ignore delete errors (item might not exist)
-        console.warn(`Error deleting ${tableName} with id ${id}:`, error);
+        console.warn(`[Sync] Error deleting ${tableName} with id ${id}:`, error);
       }
     }
   }
@@ -114,32 +157,71 @@ export class SyncService {
     for (const item of [...created, ...updated]) {
       try {
         const sanitized = sanitizeFn(item);
+        console.log(`[Sync] Processing ${tableName} item:`, sanitized);
         
         if (tableName === 'mh_products') {
           // Escape values for SQL
-          const escapeValue = (val: any): string => {
-            if (val === null || val === undefined) return 'NULL';
-            if (typeof val === 'string') return `'${val.replace(/'/g, "''")}'`;
+          const escapeValue = (val: any, fieldName: string): string => {
+            if (val === null || val === undefined) {
+              // Allow NULL for optional fields like description
+              if (fieldName === 'description') return 'NULL';
+              return 'NULL';
+            }
+            if (typeof val === 'string') {
+              // Escape single quotes in strings
+              return `'${val.replace(/'/g, "''").replace(/\\/g, '\\\\')}'`;
+            }
             if (typeof val === 'boolean') return val ? '1' : '0';
-            if (val instanceof Date) return `'${val.toISOString().slice(0, 19).replace('T', ' ')}'`;
+            if (val instanceof Date) {
+              // Format date for MySQL DATETIME: YYYY-MM-DD HH:MM:SS
+              const year = val.getFullYear();
+              const month = String(val.getMonth() + 1).padStart(2, '0');
+              const day = String(val.getDate()).padStart(2, '0');
+              const hours = String(val.getHours()).padStart(2, '0');
+              const minutes = String(val.getMinutes()).padStart(2, '0');
+              const seconds = String(val.getSeconds()).padStart(2, '0');
+              return `'${year}-${month}-${day} ${hours}:${minutes}:${seconds}'`;
+            }
+            if (typeof val === 'number') {
+              // Handle decimal numbers properly
+              return String(val);
+            }
             return String(val);
           };
 
-          const fields = Object.keys(sanitized).map(f => `\`${f}\``).join(', ');
-          const values = Object.values(sanitized).map(escapeValue).join(', ');
+          // Build field list and values
+          const fields = Object.keys(sanitized).map(f => `\`${f}\``);
+          const values = Object.entries(sanitized).map(([key, val]) => escapeValue(val, key));
           const updates = Object.keys(sanitized)
             .filter(key => key !== 'id')
             .map(key => `\`${key}\` = VALUES(\`${key}\`)`)
             .join(', ');
           
-          const sql = `INSERT INTO \`${tableName}\` (${fields}) VALUES (${values}) ON DUPLICATE KEY UPDATE ${updates}`;
+          const sql = `INSERT INTO \`${tableName}\` (${fields.join(', ')}) VALUES (${values.join(', ')}) ON DUPLICATE KEY UPDATE ${updates}`;
           
-          await this.prisma.$executeRawUnsafe(sql);
+          console.log(`[Sync] 📝 Executing SQL for ${tableName}:`);
+          console.log(`[Sync] SQL:`, sql);
+          console.log(`[Sync] 📦 Data being inserted:`, JSON.stringify(sanitized, null, 2));
+          
+          const result = await this.prisma.$executeRawUnsafe(sql);
+          console.log(`[Sync] ✅ SQL executed successfully. Rows affected:`, result);
+          
+          // Verify the data was inserted by querying it back
+          try {
+            const inserted = await this.prisma.$queryRawUnsafe(
+              `SELECT * FROM \`${tableName}\` WHERE \`id\` = '${sanitized.id.replace(/'/g, "''")}'`
+            ) as any[];
+            const serializedInserted = this.serializeBigInt(inserted);
+            console.log(`[Sync] 🔍 Verified inserted data:`, JSON.stringify(serializedInserted, null, 2));
+          } catch (verifyError) {
+            console.warn(`[Sync] ⚠️ Could not verify inserted data:`, verifyError);
+          }
         } else {
           throw new Error(`Raw SQL sync not implemented for table: ${tableName}`);
         }
       } catch (error) {
-        console.error(`Error syncing ${tableName} with raw SQL:`, error);
+        console.error(`[Sync] Error syncing ${tableName} with raw SQL:`, error);
+        console.error(`[Sync] Item that failed:`, item);
         throw error;
       }
     }
@@ -150,7 +232,7 @@ export class SyncService {
         const escapedId = typeof id === 'string' ? `'${id.replace(/'/g, "''")}'` : String(id);
         await this.prisma.$executeRawUnsafe(`DELETE FROM \`${tableName}\` WHERE \`id\` = ${escapedId}`);
       } catch (error) {
-        console.warn(`Error deleting ${tableName} with id ${id}:`, error);
+        console.warn(`[Sync] Error deleting ${tableName} with id ${id}:`, error);
       }
     }
   }
@@ -195,12 +277,12 @@ export class SyncService {
     const { _status, _changed, ...rest } = item;
 
     // Convert price to Decimal (Prisma Decimal type)
-    const price = typeof item.price === 'number' ? item.price : parseFloat(item.price) || 0;
+    const price = typeof item.price === 'number' ? item.price : parseFloat(String(item.price)) || 0;
 
     // Convert stock_quantity to integer
     const stock_quantity = typeof item.stock_quantity === 'number' 
       ? Math.floor(item.stock_quantity) 
-      : parseInt(item.stock_quantity, 10) || 0;
+      : parseInt(String(item.stock_quantity), 10) || 0;
 
     // Convert is_active to boolean
     const is_active = typeof item.is_active === 'boolean' 
@@ -208,16 +290,31 @@ export class SyncService {
       : item.is_active === 'true' || item.is_active === true || item.is_active === 1;
 
     // Convert updated_at from timestamp to Date (or use current time)
-    const updated_at = item.updated_at 
-      ? new Date(typeof item.updated_at === 'number' ? item.updated_at : new Date(item.updated_at).getTime())
-      : new Date();
+    let updated_at: Date;
+    if (item.updated_at) {
+      if (typeof item.updated_at === 'number') {
+        updated_at = new Date(item.updated_at);
+      } else if (item.updated_at instanceof Date) {
+        updated_at = item.updated_at;
+      } else {
+        updated_at = new Date(String(item.updated_at));
+      }
+    } else {
+      updated_at = new Date();
+    }
+
+    // Handle description - can be null/undefined/empty string
+    const description = item.description && item.description.trim() !== '' ? item.description : null;
 
     return {
-      ...rest,
-      price,
-      stock_quantity,
-      is_active,
-      updated_at,
+      id: item.id,
+      product_code: item.product_code,
+      product_name: item.product_name,
+      description: description,
+      price: price,
+      stock_quantity: stock_quantity,
+      is_active: is_active,
+      updated_at: updated_at,
     };
   }
 }

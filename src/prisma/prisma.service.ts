@@ -5,13 +5,50 @@ import { PrismaClient } from '@prisma/client';
 export class PrismaService extends PrismaClient implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(PrismaService.name);
 
+  // Helper to serialize BigInt values for JSON.stringify
+  private serializeBigInt(obj: any): any {
+    if (obj === null || obj === undefined) {
+      return obj;
+    }
+    if (typeof obj === 'bigint') {
+      return obj.toString();
+    }
+    if (Array.isArray(obj)) {
+      return obj.map(item => this.serializeBigInt(item));
+    }
+    if (typeof obj === 'object') {
+      const serialized: any = {};
+      for (const key in obj) {
+        if (Object.prototype.hasOwnProperty.call(obj, key)) {
+          serialized[key] = this.serializeBigInt(obj[key]);
+        }
+      }
+      return serialized;
+    }
+    return obj;
+  }
+
   async onModuleInit() {
-    await this.$connect();
-    await this.ensureTableExists();
+    try {
+      // Test database connection
+      await this.$connect();
+      this.logger.log('✅ Database connection established');
+      
+      // Verify connection with a simple query
+      const result = await this.$queryRawUnsafe('SELECT 1 as connected, DATABASE() as db_name, USER() as db_user') as any[];
+      const serializedResult = this.serializeBigInt(result);
+      this.logger.log('📊 Database connection verified:', JSON.stringify(serializedResult, null, 2));
+      
+      await this.ensureTableExists();
+    } catch (error) {
+      this.logger.error('❌ Failed to connect to database:', error);
+      throw error;
+    }
   }
 
   async onModuleDestroy() {
     await this.$disconnect();
+    this.logger.log('🔌 Database connection closed');
   }
 
   private async ensureTableExists() {
